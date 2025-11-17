@@ -4,8 +4,9 @@ const cors = require('cors');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
+const { v2: cloudinary } = require('cloudinary');
 const authMiddleware = require('./authMiddleware');
-const upload = require('./uploadConfig');
+const upload = require('./UploadConfig');
 
 const app = express();
 
@@ -31,7 +32,10 @@ const LaporanSchema = new mongoose.Schema({
 const pengumumanSchema = new mongoose.Schema ({
     judul: {type:String, required:true},
     isi: {type:String, required:true},
-    imageUrls: {type : [String], default: []},
+    imageFiles: [{
+    url: String,
+    filename: String // Ini adalah public_id di Cloudinary
+    }],
 }, {timestamps: true
 });
 
@@ -235,6 +239,23 @@ app.delete('/api/laporan/:id', authMiddleware, async (req, res) => {
             return res.status(404).json({ error: 'Laporan tidak ditemukan' });
         }
 
+        // --- AWAL KODE TAMBAHAN UNTUK LAPORAN ---
+    try {
+    // Kita gunakan 'files' sesuai nama di LaporanSchema
+        if (laporanDihapus.files && laporanDihapus.files.length > 0) {
+
+        // Dapatkan semua 'filename' (public_id)
+        const publicIds = laporanDihapus.files.map(file => file.filename);
+
+        // Perintahkan Cloudinary untuk menghapus file-file ini
+        await cloudinary.api.delete_resources(publicIds);
+    }
+    } catch (err) {
+        console.error('Gagal menghapus file laporan dari Cloudinary:', err);
+    // Jika gagal, jangan batalkan respons sukses, cukup catat errornya
+}
+// --- AKHIR KODE TAMBAHAN UNTUK LAPORAN ---
+
         res.json({ message: 'Laporan berhasil dihapus', data: laporanDihapus });
 
     } catch (err) {
@@ -273,7 +294,10 @@ app.post('/api/pengumuman', authMiddleware, upload.array('imageUrls', 3), async 
         const { judul, isi } = req.body;
 
         // Ambil URL file dari Cloudinary (jika ada)
-        const imageUrls = req.files ? req.files.map(file => file.path) : [];
+        const imageFiles = req.files ? req.files.map(file => ({
+            url: file.path,
+            filename: file.filename // <-- INI YANG PENTING
+        })) : [];
 
         // Validasi dasar
         if (!judul || !isi) {
@@ -283,7 +307,7 @@ app.post('/api/pengumuman', authMiddleware, upload.array('imageUrls', 3), async 
         const pengumumanBaru = new Pengumuman({
             judul,
             isi,
-            imageUrls: imageUrls // Simpan array URL ke database
+            imageFiles: imageFiles // Simpan array URL ke database
         });
 
         await pengumumanBaru.save();
@@ -294,42 +318,92 @@ app.post('/api/pengumuman', authMiddleware, upload.array('imageUrls', 3), async 
     }
 });
 
+// server.js
+
+// ... (semua kode lain di atas biarkan saja) ...
+
 /**
- * @route   PUT /api/pengumuman/:id
- * @desc    Mengupdate pengumuman (Admin Only)
- * @access  Private
- */
-app.put('/api/pengumuman/:id', authMiddleware, async (req, res) => {
-    // Catatan: API update ini tidak menangani update file, hanya teks.
-    // Update file (gambar) biasanya lebih rumit (harus hapus file lama di cloudinary, dll)
-    // Untuk sekarang, kita buat sederhana dulu.
-    
-    try {
-        const { judul, isi, imageUrls } = req.body; // Kita izinkan update URL secara manual jika perlu
-        const pengumumanId = req.params.id;
+ * @route   PUT /api/pengumuman/:id
+ * @desc    Mengupdate pengumuman (Admin Only) DENGAN FILE
+ * @access  Private
+ */
+// --- PERBAIKAN: Ganti upload.array() menjadi upload.any() ---
+app.put('/api/pengumuman/:id', authMiddleware, upload.any(), async (req, res) => {
+    try {
+        // upload.any() menaruh field teks di req.body
+        const { judul, isi, existingFiles } = req.body; 
+        // upload.any() menaruh field file di req.files
+        const newUploadedFiles = req.files || [];
+        const pengumumanId = req.params.id;
 
-        const dataUpdate = {
-            judul,
-            isi,
-            imageUrls
-        };
-
-        const pengumumanTerupdate = await Pengumuman.findByIdAndUpdate(
-            pengumumanId,
-            dataUpdate,
-            { new: true } // Kirim kembali dokumen yang sudah terupdate
-        );
-
-        if (!pengumumanTerupdate) {
+        // 1. Cari data pengumuman lama
+        const pengumumanLama = await Pengumuman.findById(pengumumanId);
+        if (!pengumumanLama) {
             return res.status(404).json({ error: 'Pengumuman tidak ditemukan' });
         }
 
-        res.json({ message: 'Pengumuman berhasil diupdate', data: pengumumanTerupdate });
+        // 2. Parse file lama yang dikirim dari frontend untuk disimpan
+        let filesToKeep = [];
+        if (existingFiles) {
+            try {
+                filesToKeep = JSON.parse(existingFiles); 
+            } catch (e) {
+                return res.status(400).json({ error: 'Format existingFiles salah' });
+            }
+        }
+        
+        // 3. Tentukan file mana yang harus dihapus dari Cloudinary
+        const oldFilenames = pengumumanLama.imageFiles ? pengumumanLama.imageFiles.map(f => f.filename) : [];
+        const keptFilenames = filesToKeep.map(f => f.filename);
+        const filesToDelete = oldFilenames.filter(filename => !keptFilenames.includes(filename));
 
-    } catch (err) {
-        res.status(500).json({ error: 'Gagal update pengumuman: ' + err.message });
-    }
+        if (filesToDelete.length > 0) {
+            await cloudinary.api.delete_resources(filesToDelete);
+        }
+
+        // 4. Ambil file baru (pastikan fieldname-nya benar)
+        const newFiles = newUploadedFiles
+            .filter(file => file.fieldname === 'imageUrls')
+            .map(file => ({
+                url: file.path,
+                filename: file.filename
+            }));
+
+        // 5. Gabungkan file lama yang disimpan + file baru
+        const updatedImageFiles = [...filesToKeep, ...newFiles];
+
+        // --- FITUR BARU: Validasi gambar wajib (sesuai permintaan Anda) ---
+        if (updatedImageFiles.length === 0) {
+            return res.status(400).json({ error: 'Pengumuman harus memiliki setidaknya satu gambar.' });
+        }
+        // --- BATAS FITUR BARU ---
+
+        // 6. Buat objek update untuk MongoDB
+        const dataUpdate = {
+            judul: judul, // Dengan upload.any(), ini adalah string biasa
+            isi: isi,
+            imageFiles: updatedImageFiles 
+        };
+
+        // 7. Lakukan update di MongoDB
+        const pengumumanTerupdate = await Pengumuman.findByIdAndUpdate(
+            pengumumanId,
+            dataUpdate,
+            { new: true } 
+        );
+
+        res.json({ message: 'Pengumuman berhasil diupdate', data: pengumumanTerupdate });
+
+    } catch (err) {
+        console.error('Error saat update pengumuman:', err);
+        res.status(500).json({ error: 'Gagal update pengumuman: ' + err.message });
+    }
 });
+
+// ... (sisa kode server.js Anda) ...
+// --- AKHIR PERBAIKAN ENDPOINT PUT PENGUMUMAN ---
+
+// ... sisa kode Anda di server.js (seperti app.delete('/api/pengumuman/:id'), PORT, dll.) ...
 
 /**
  * @route   DELETE /api/pengumuman/:id
@@ -346,6 +420,23 @@ app.delete('/api/pengumuman/:id', authMiddleware, async (req, res) => {
             return res.status(404).json({ error: 'Pengumuman tidak ditemukan' });
         }
 
+        // --- TAMBAHAN BARU ---
+    try {
+    // Kita gunakan 'imageFiles' sesuai nama skema baru kita
+         if (pengumumanDihapus.imageFiles && pengumumanDihapus.imageFiles.length > 0) {
+
+        // Dapatkan semua 'filename' (public_id) dari data yang dihapus
+        const publicIds = pengumumanDihapus.imageFiles.map(file => file.filename);
+
+        // Perintahkan Cloudinary untuk menghapus file-file ini
+        await cloudinary.api.delete_resources(publicIds);
+    }
+    } catch (err) {
+    console.error('Gagal menghapus file pengumuman dari Cloudinary:', err);
+    // Jika gagal, jangan batalkan respons sukses, cukup catat errornya
+}
+// --- BATAS TAMBAHAN ---
+
         // Catatan: Ini belum menghapus file dari Cloudinary.
         // File-nya akan tetap ada di Cloudinary, tapi datanya terhapus dari MongoDB.
         // Ini adalah area yang bisa ditingkatkan nanti.
@@ -354,7 +445,7 @@ app.delete('/api/pengumuman/:id', authMiddleware, async (req, res) => {
 
     } catch (err) {
         res.status(500).json({ error: 'Gagal menghapus pengumuman: ' + err.message });
-    }
+    }  
 });
 
 const PORT = process.env.PORT || 3001;
