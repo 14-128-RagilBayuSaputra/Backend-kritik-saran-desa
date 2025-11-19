@@ -127,6 +127,95 @@ app.post('/api/admin/login', async (req, res) => {
 });
 
 /**
+ * @route   PUT /api/admin/update
+ * @desc    Update Username & Password Admin (Single Admin Mode)
+ */
+app.put('/api/admin/update', authMiddleware, async (req, res) => {
+    try {
+        const { newUsername, newPassword, currentPassword } = req.body;
+        const adminId = req.admin.adminId; // Dari token
+
+        // 1. Cari admin di database
+        const admin = await Admin.findById(adminId);
+        if (!admin) return res.status(404).json({ error: 'Admin tidak ditemukan' });
+
+        // 2. WAJIB: Cek password lama sebagai konfirmasi keamanan
+        const isMatch = await bcrypt.compare(currentPassword, admin.password);
+        if (!isMatch) {
+            return res.status(400).json({ error: 'Password saat ini salah! Perubahan ditolak.' });
+        }
+
+        // 3. Update Username (Jika diisi)
+        if (newUsername && newUsername.trim() !== '') {
+            // Cek apakah username sudah dipakai orang lain (opsional jika admin cuma 1, tapi bagus untuk validasi)
+            const exist = await Admin.findOne({ username: newUsername });
+            if (exist && exist._id.toString() !== adminId) {
+                return res.status(400).json({ error: 'Username sudah digunakan.' });
+            }
+            admin.username = newUsername;
+        }
+
+        // 4. Update Password Baru (Jika diisi)
+        if (newPassword && newPassword.trim() !== '') {
+            const salt = await bcrypt.genSalt(10);
+            admin.password = await bcrypt.hash(newPassword, salt);
+        }
+
+        await admin.save();
+
+        res.json({ message: 'Profil admin berhasil diperbarui.' });
+
+    } catch (err) {
+        res.status(500).json({ error: 'Gagal update profil: ' + err.message });
+    }
+});
+
+/**
+ * @route   POST /api/admin/reset-password-force
+ * @desc    HARD RESET: Hapus semua admin, buat satu baru.
+ */
+app.post('/api/admin/reset-password-force', async (req, res) => {
+    try {
+        const { recoveryCode, newPassword } = req.body;
+
+        console.log("Melakukan HARD RESET Admin...");
+
+        // 1. Cek Kode Pemulihan
+        if (!recoveryCode || recoveryCode !== process.env.ADMIN_RECOVERY_CODE) {
+            return res.status(403).json({ error: 'Kode Pemulihan SALAH!' });
+        }
+
+        if (!newPassword || newPassword.trim() === '') {
+            return res.status(400).json({ error: 'Password baru tidak boleh kosong.' });
+        }
+
+        // 2. SAPU BERSIH: Hapus SEMUA data di tabel Admin
+        // Ini memastikan tidak ada akun ganda atau akun nyangkut
+        await Admin.deleteMany({}); 
+
+        // 3. Buat Admin Baru yang Fresh
+        const salt = await bcrypt.genSalt(10);
+        const hashedPassword = await bcrypt.hash(newPassword, salt);
+
+        const newAdmin = new Admin({
+            username: 'admin', // KITA PAKSA USERNAME JADI 'admin' (huruf kecil semua)
+            password: hashedPassword
+        });
+
+        await newAdmin.save();
+
+        console.log("HARD RESET Sukses. Database Admin bersih.");
+        res.json({ 
+            message: 'Akun di-reset total! Login dengan Username: admin' 
+        });
+
+    } catch (err) {
+        console.error("Error reset password:", err);
+        res.status(500).json({ error: 'Gagal reset: ' + err.message });
+    }
+});
+
+/**
  * @route   POST /api/laporan
  * @desc    Membuat laporan baru (oleh user) DENGAN FILE
  * @access  Public
